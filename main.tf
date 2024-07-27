@@ -13,7 +13,7 @@ provider "spotify" {
 
 data "spotify_search_track" "RAM" {
   album = "Random Access Memories (10th Anniversary Edition)"
-  limit = 8
+  limit = 9
 }
 
 data "spotify_search_track" "LImperatrice" {
