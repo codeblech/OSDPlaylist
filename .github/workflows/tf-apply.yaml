@@ -1,108 +1,16 @@
-# name: Update playlist with Spotify Auth
-# on:
-#   push:
-#     branches:
-#       - main
-# jobs:
-#   spotify-auth-and-apply:
-#     runs-on: ubuntu-latest
-#     name: Apply
-#     steps:
-#       - name: Checkout repository
-#         uses: actions/checkout@v4
-
-#       - name: Setup Go
-#         uses: actions/setup-go@v5
-#         with:
-#           go-version: '1.18.0'
-
-#       - name: Install spotify_auth_proxy
-#         run: go install github.com/conradludgate/terraform-provider-spotify/spotify_auth_proxy@latest
-
-#       - name: Run spotify_auth_proxy and capture Auth URL
-#         env:
-#           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
-#           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-#           SPOTIFY_CLIENT_REDIRECT_URI: ${{ secrets.SPOTIFY_CLIENT_REDIRECT_URI }}
-#         run: |
-#           spotify_auth_proxy > proxy_output.log 2>&1 &
-#           PROXY_PID=$!
-#           echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
-
-#           # Wait for the Auth URL and API Key to appear in the log
-#           while ! (grep -q "Auth URL:" proxy_output.log && grep -q "APIKey:" proxy_output.log); do
-#             sleep 1
-#           done
-
-#           auth_url=$(grep "Auth URL:" proxy_output.log | awk '{print $3}')
-#           api_key=$(grep "APIKey:" proxy_output.log | awk '{print $2}')
-#           echo "AUTH_URL=$auth_url" >> $GITHUB_ENV
-#           echo "SPOTIFY_API_KEY=$api_key" >> $GITHUB_ENV
-
-
-#       - name: Setup Node.js
-#         uses: actions/setup-node@v3
-#         with:
-#           node-version: '18'
-
-#       - name: Install Puppeteer
-#         run: npm install puppeteer
-
-#       - name: Perform Spotify login
-#         env:
-#           SPOTIFY_USERNAME: ${{ secrets.SPOTIFY_USERNAME }}
-#           SPOTIFY_PASSWORD: ${{ secrets.SPOTIFY_PASSWORD }}
-#         run: |
-#           node - <<EOF
-#           const puppeteer = require('puppeteer');
-
-#           (async () => {
-#             const browser = await puppeteer.launch({ headless: true });
-#             const page = await browser.newPage();
-
-#             try {
-#               await page.goto('${{ env.AUTH_URL }}');
-
-#               // Wait for login form and fill in credentials
-#               await page.waitForSelector('#login-username');
-#               await page.type('#login-username', process.env.SPOTIFY_USERNAME);
-#               await page.type('#login-password', process.env.SPOTIFY_PASSWORD);
-
-#               // Submit the form
-#               await page.click('#login-button');
-
-#               // Wait for redirect and authorization
-#               await page.waitForNavigation({ waitUntil: 'networkidle0' });
-
-#               // Check for successful authorization
-#               const content = await page.content();
-#               if (content.includes('Authorization successful')) {
-#                 console.log('Spotify authorization successful');
-#               } else {
-#                 throw new Error('Authorization not successful');
-#               }
-#             } catch (error) {
-#               console.error('Error during Spotify login:', error);
-#               process.exit(1);
-#             } finally {
-#               await browser.close();
-#             }
-#           })();
-#           EOF
-#       - name: Run Terraform Apply
-#         run: |
-#           terraform init
-#           terraform apply -var="SPOTIFY_API_KEY=${{ env.SPOTIFY_API_KEY }}" -auto-approve
-
 name: Update playlist with Spotify Auth
+
 on:
   push:
     branches:
       - main
+
 jobs:
   spotify-auth-and-apply:
     runs-on: ubuntu-latest
-    name: Apply
+    name: Authenticate and Apply
+    timeout-minutes: 15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -110,110 +18,166 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.18.0'
+          go-version: '1.21'
 
-      - name: Install spotify_auth_proxy
-        run: go install github.com/conradludgate/terraform-provider-spotify/spotify_auth_proxy@latest
+      - name: Install patched spotify_auth_proxy from fork
+        run: |
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          git clone -b fix/base-url-127 https://github.com/gauravslnk/terraform-provider-spotify
+          cd terraform-provider-spotify/spotify_auth_proxy
+          go build -o $HOME/go/bin/spotify_auth_proxy .
+          if ! command -v spotify_auth_proxy &> /dev/null; then
+            echo "::error::Installation failed"
+            exit 1
+          fi
 
-      - name: Run spotify_auth_proxy and capture Auth URL
+      - name: Run spotify_auth_proxy
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-          SPOTIFY_CLIENT_REDIRECT_URI: ${{ secrets.SPOTIFY_CLIENT_REDIRECT_URI }}
+          SPOTIFY_REDIRECT_URI: ${{ secrets.SPOTIFY_REDIRECT_URI }}
+          SPOTIFY_PROXY_BASE_URI: http://127.0.0.1:8080
         run: |
-          spotify_auth_proxy > proxy_output.log 2>&1 &
-          PROXY_PID=$!
-          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
-          while ! (grep -q "Auth URL:" proxy_output.log && grep -q "APIKey:" proxy_output.log); do
+          spotify_auth_proxy --port 8080 > proxy.log 2>&1 &
+          echo "Waiting for auth URL..."
+          for i in {1..30}; do
+            if grep -q "Auth URL:" proxy.log; then break; fi
             sleep 1
           done
-          auth_url=$(grep "Auth URL:" proxy_output.log | awk '{print $3}')
-          api_key=$(grep "APIKey:" proxy_output.log | awk '{print $2}')
+          auth_url=$(grep "Auth URL:" proxy.log | awk '{print $3}')
+          api_key=$(grep "APIKey:" proxy.log | awk '{print $2}')
           echo "AUTH_URL=$auth_url" >> $GITHUB_ENV
           echo "SPOTIFY_API_KEY=$api_key" >> $GITHUB_ENV
+          if [ -z "$auth_url" ] || [ -z "$api_key" ]; then
+            echo "::error::Failed to get auth credentials"
+            cat proxy.log
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
-          node-version: '18'
+          node-version: '20'
 
-      - name: Install Puppeteer
-        run: npm install puppeteer
+      - name: Install Node dependencies
+        run: npm install puppeteer@22.8.2 fs-extra@11
 
       - name: Perform Spotify login and authorization
         env:
+          AUTH_URL: ${{ env.AUTH_URL }}
           SPOTIFY_USERNAME: ${{ secrets.SPOTIFY_USERNAME }}
           SPOTIFY_PASSWORD: ${{ secrets.SPOTIFY_PASSWORD }}
         run: |
-          node - <<EOF
+          node - <<'EOF'
           const puppeteer = require('puppeteer');
-          
-          function getRandomDelay(min, max) {
-            return Math.floor(Math.random() * (max - min + 1) + min);
-          }
-
-          function delay(ms) {
-            return new Promise(resolve => setTimeout(resolve, ms));
-          }
-
-          async function typeWithRandomDelay(page, selector, text) {
+          const fs = require('fs-extra');
+          const delay = ms => new Promise(res => setTimeout(res, ms));
+          const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1) + min);
+          async function typeWithHumanDelay(page, selector, text) {
             for (const char of text) {
-              await page.type(selector, char, { delay: getRandomDelay(50, 150) });
+              await page.type(selector, char, { delay: randomDelay(30, 100) });
+              if (Math.random() > 0.8) await delay(randomDelay(50, 150));
             }
           }
-
-          async function waitForSelectorWithTimeout(page, selector, timeout) {
-            try {
-              await page.waitForSelector(selector, { visible: true, timeout: timeout });
-              return true;
-            } catch (error) {
-              if (error.name === 'TimeoutError') {
-                return false;
+          async function clickByText(page, text, tag = '*') {
+            const elements = await page.$$(tag);
+            for (const el of elements) {
+              const content = await page.evaluate(el => el.textContent?.trim(), el);
+              if (content?.toLowerCase() === text.toLowerCase()) {
+                await el.click();
+                return true;
               }
-              throw error;
             }
+            return false;
+          }
+          async function safeClick(page, selector, timeout = 10000) {
+            try {
+              await page.waitForSelector(selector, { visible: true, timeout });
+              await delay(500);
+              const element = await page.$(selector);
+              if (element) {
+                await element.click();
+                return true;
+              }
+            } catch {}
+            return false;
           }
 
           (async () => {
             const browser = await puppeteer.launch({
               headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1920,1080'],
-              defaultViewport: { width: 1920, height: 1080 }
+              args: ['--no-sandbox', '--disable-setuid-sandbox'],
+              defaultViewport: { width: 1280, height: 800 }
             });
             const page = await browser.newPage();
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-            
+            await page.setUserAgent('Mozilla/5.0');
+
             try {
-              await page.goto('${{ env.AUTH_URL }}', { waitUntil: 'networkidle0' });
-              await page.waitForSelector('#login-username', { visible: true });
-              
-              await typeWithRandomDelay(page, '#login-username', process.env.SPOTIFY_USERNAME);
-              await delay(getRandomDelay(500, 1500));
-              await typeWithRandomDelay(page, '#login-password', process.env.SPOTIFY_PASSWORD);
-              
-              await delay(getRandomDelay(1000, 2000));
-              await page.click('#login-button');
-              
-              // Wait for either the authorization button or successful authorization
-              const authAcceptSelector = '#auth-accept';
-              const authSuccessTimeout = 20000; // 20 seconds
-              
-              const isAuthAcceptPresent = await waitForSelectorWithTimeout(page, authAcceptSelector, authSuccessTimeout);
-              
-              if (isAuthAcceptPresent) {
-                console.log('Permission request detected. Accepting...');
-                await page.click(authAcceptSelector);
-                await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 30000 });
+              console.log("🌐 Navigating to Spotify Auth URL...");
+              await page.goto(process.env.AUTH_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+              console.log("📍 Current page:", page.url());
+
+              if (page.url().includes('accounts.google.com')) {
+                throw new Error("❌ Redirected to Google login instead of Spotify login.");
               }
-              
-              const content = await page.content();
-              if (content.includes('Authorization successful') || content.includes('callback?code=')) {
-                console.log('Spotify authorization successful');
-              } else {
-                throw new Error('Authorization not successful');
+
+              console.log("📧 Entering email...");
+              await page.waitForSelector('input[type="email"], #login-username', { visible: true, timeout: 15000 });
+              await typeWithHumanDelay(page, 'input[type="email"], #login-username', process.env.SPOTIFY_USERNAME);
+              await delay(1000);
+
+              console.log("➡️ Clicking Continue...");
+              const continued = await clickByText(page, 'Continue') ||
+                                await safeClick(page, 'button[data-testid="login-button"]') ||
+                                await safeClick(page, 'button[type="submit"]');
+              if (!continued) throw new Error("❌ Continue button not found.");
+
+              await delay(3000);
+
+              const otpDetected = await page.evaluate(() =>
+                Array.from(document.querySelectorAll('*')).some(el =>
+                  el.textContent?.toLowerCase().includes('6-digit code')
+                )
+              );
+
+              if (otpDetected) {
+                console.log("🔁 Switching to password login...");
+                const clicked = await clickByText(page, 'Log in with a password') ||
+                                await safeClick(page, 'button[data-encore-id="buttonTertiary"]');
+                if (!clicked) throw new Error("❌ Could not find 'Log in with a password'.");
+                await delay(3000);
               }
+
+              console.log("🔑 Entering password...");
+              await page.waitForSelector('input[type="password"]', { visible: true, timeout: 10000 });
+              await typeWithHumanDelay(page, 'input[type="password"]', process.env.SPOTIFY_PASSWORD);
+              await delay(1000);
+
+              console.log("🚀 Logging in...");
+              const loggedIn = await safeClick(page, '#login-button') ||
+                               await safeClick(page, 'button[data-testid="login-button"]') ||
+                               await safeClick(page, 'button[data-encore-id="buttonPrimary"]') ||
+                               await clickByText(page, 'Log In');
+              if (!loggedIn) throw new Error("❌ Login button not found.");
+
+              await delay(5000);
+
+              const authorized = await safeClick(page, '#auth-accept') || await clickByText(page, 'Agree');
+              if (authorized) {
+                console.log("✅ Accepted authorization.");
+                await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 });
+              }
+
+              const finalURL = page.url();
+              if (!finalURL.includes('callback?code=')) {
+                throw new Error(`❌ Authorization failed. Final URL: ${finalURL}`);
+              }
+
+              console.log("🎉 Spotify authorization successful!");
             } catch (error) {
-              console.error('Error during Spotify login or authorization:', error);
+              console.error("💥 Error during login:", error.message);
+              await page.screenshot({ path: 'spotify_error.png', fullPage: true });
+              await fs.writeFile('error_debug.html', await page.content());
               process.exit(1);
             } finally {
               await browser.close();
@@ -221,7 +185,54 @@ jobs:
           })();
           EOF
 
-      - name: Run Terraform Apply
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Clean Terraform State if Playlist Invalid
+        env:
+          SPOTIFY_API_KEY: ${{ env.SPOTIFY_API_KEY }}
         run: |
-          terraform init
-          terraform apply -var="SPOTIFY_API_KEY=${{ env.SPOTIFY_API_KEY }}" -auto-approve
+          if grep -q "spotify_playlist" terraform.tfstate; then
+            echo "Checking playlist ownership..."
+            PLAYLIST_ID=$(jq -r '.resources[] | select(.type=="spotify_playlist") | .instances[0].attributes.id' terraform.tfstate)
+            RESPONSE=$(curl -s -H "Authorization: Bearer $SPOTIFY_API_KEY" https://api.spotify.com/v1/playlists/$PLAYLIST_ID)
+            if echo "$RESPONSE" | grep -q "\"error\""; then
+              echo "❌ Playlist does not exist or does not belong to current user. Resetting state..."
+              rm -f terraform.tfstate terraform.tfstate.backup
+            else
+              echo "✅ Playlist exists and belongs to user. Continuing..."
+            fi
+          else
+            echo "ℹ️ No playlist in state. Continuing..."
+          fi
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        env:
+          SPOTIFY_API_KEY: ${{ env.SPOTIFY_API_KEY }}
+        run: terraform plan -var "SPOTIFY_API_KEY=${SPOTIFY_API_KEY}"
+
+      - name: Terraform Apply
+        env:
+          SPOTIFY_API_KEY: ${{ env.SPOTIFY_API_KEY }}
+        run: terraform apply -auto-approve -var "SPOTIFY_API_KEY=${SPOTIFY_API_KEY}"
+
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spotify-debug
+          path: |
+            spotify_error.png
+            error_debug.html
+            proxy.log
